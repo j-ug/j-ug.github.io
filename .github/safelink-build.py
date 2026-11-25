@@ -749,6 +749,20 @@ def upgrade_atlas_map(atlas):
   nearbyRadius.setAttribute("aria-label", "Nearby radius");
   for (const km of [1.5, 3, 5]) nearbyRadius.add(new Option(km + " km", String(km * 1000), false, km === 3));
   el("state-refresh").before(nearbyRadius);
+  const nearbyArea = document.createElement("select");
+  nearbyArea.setAttribute("aria-label","Jump to Trichy area");
+  nearbyArea.add(new Option("Jump to Trichy area",""));
+  const localAreas = [["Central Trichy","trichy-data"],["Woraiyur","offline-data-woraiyur"],["Manapparai","offline-data-manapparai"],["Srirangam","offline-data-srirangam"],["Thillai Nagar","offline-data-thillai"]];
+  for (const [label,id] of localAreas) nearbyArea.add(new Option(label,id));
+  nearbyRadius.before(nearbyArea);
+  nearbyArea.addEventListener("change", () => {
+    const node = el(nearbyArea.value);
+    if (!node) return;
+    const [y,x] = JSON.parse(node.textContent).origin;
+    if (streetReady) map.jumpTo({center:[x,y],zoom:14});
+    else { lng=x; lat=y; zoom=8; invalidate(); }
+    nearby();
+  });
   const nearbyPlaces = document.createElement("ol");
   nearbyPlaces.className = "safelink-nearby";
   nearbyPlaces.setAttribute("aria-label", "Nearest mapped places");
@@ -781,6 +795,30 @@ def upgrade_atlas_map(atlas):
       unique.push(place);
     }
     return [...unique.filter(place => place.kind !== "lights").slice(0,180), ...unique.filter(place => place.kind === "lights").slice(0,100)];
+  }
+  function bundledNearby(centre, radius) {
+    const known = new Map();
+    for (const id of ["trichy-data","offline-data-woraiyur","offline-data-manapparai","offline-data-srirangam","offline-data-thillai"]) {
+      const node = el(id);
+      if (!node) continue;
+      const {origin,places} = JSON.parse(node.textContent);
+      const [lat0,lon0,sx,sy] = origin;
+      for (const [label,category,x,y,type,id] of places) {
+        const point = [lon0+x/sx,lat0-y/sy];
+        const distance = distanceMeters(centre,point);
+        if (distance > radius) continue;
+        const kind = /hospital|clinic|pharmacy|health/i.test(category) ? "health" :
+          /police/i.test(category) ? "police" : /station|bus|rail|taxi/i.test(category) ? "transit" : "landmark";
+        known.set(type+"/"+id,{kind,point,label,distance,osm:"https://www.openstreetmap.org/"+type+"/"+id});
+      }
+    }
+    return [...known.values()].sort((a,b)=>a.distance-b.distance);
+  }
+  function renderNearbyCounts() {
+    for (const kind of Object.keys(palette)) {
+      const counter = el("state-count-"+kind);
+      if (counter) counter.textContent = features.length ? features.filter(f=>f.kind===kind).length : "—";
+    }
   }
   function contextQuery([x,y], radius) {
     const near = "(around:" + radius + "," + y.toFixed(5) + "," + x.toFixed(5) + ")";
@@ -822,7 +860,16 @@ def upgrade_atlas_map(atlas):
     }
   }
 """ + context[right:]
-    context = context.replace('    contextPending=true;', '    const radius=Number(nearbyRadius.value);\n    nearbyRadius.disabled=true;\n    contextPending=true;', 1)
+    context = context.replace('    contextPending=true;', r"""
+    const radius=Number(nearbyRadius.value);
+    const bundled=bundledNearby(p,radius);
+    features=bundled;
+    renderNearby();
+    renderNearbyCounts();
+    redrawn();
+    nearbyRadius.disabled=true;
+    nearbyArea.disabled=true;
+    contextPending=true;""", 1)
     context = context.replace('p.map(v=>v.toFixed(3)).join(",")', 'p.map(v=>v.toFixed(5)).join(",")+":"+radius', 1)
     request_start = context.index('        const urls=[')
     request_end = context.index('        if (result.values', request_start)
@@ -831,10 +878,16 @@ def upgrade_atlas_map(atlas):
         result={values:await Promise.allSettled([findNearbyData(p,radius),fetchJson(weatherUrl,13)]),time:Date.now()};
 """ + context[request_end:]
     context = context.replace('result.values.every(value=>value.status==="fulfilled")', 'result.values[0].status==="fulfilled"')
-    context = context.replace('contextFrom(osm.value):[];', 'contextFrom(osm.value,p,radius):[];\n      renderNearby();')
+    context = context.replace('contextFrom(osm.value):[];', 'contextFrom(osm.value,p,radius):bundled;\n      if (!features.length && bundled.length) features=bundled;\n      renderNearby();')
+    count_start = context.index('      for (const kind of Object.keys(palette))', context.index('const [osm,weather]'))
+    count_end = context.index('      const current=', count_start)
+    context = context[:count_start] + '      renderNearbyCounts();\n' + context[count_end:]
+    context = context.replace('"Mapped feature service unavailable. Try again in a moment."', '(bundled.length ? "Live lookup unavailable. Showing bundled OpenStreetMap places near this centre." : "Live lookup unavailable and no bundled places near this centre.")')
     context = context.replace('"Mapped points within 1.8 km of the selected centre (up to 180). Select a dot for details."', '"OpenStreetMap places within "+radius/1000+" km of the queried centre. Distances are straight-line. Lamp coverage is sampled within 1.6 km."')
-    context = context.replace('contextPending=false;refreshControls();','nearbyRadius.disabled=false;contextPending=false;refreshControls();')
+    context = context.replace('contextPending=false;refreshControls();','nearbyRadius.disabled=false;nearbyArea.disabled=false;contextPending=false;refreshControls();')
     atlas = atlas[:start] + context + atlas[end:]
+    atlas = atlas.replace('palette[feature.kind],', '(palette[feature.kind] || "#7e4775"),', 1)
+    atlas = atlas.replace('color:palette[f.kind]', 'color:palette[f.kind] || "#7e4775"', 1)
     anchor = '  function resizeAndLoad() {'
     return atlas.replace(anchor, r"""
   const baseStyle = document.createElement("select");
