@@ -914,6 +914,7 @@ def upgrade_atlas_map(atlas):
 """ + context[request_end:]
     context = context.replace('result.values.every(value=>value.status==="fulfilled")', 'result.values[0].status==="fulfilled"')
     context = context.replace('contextFrom(osm.value):[];', 'contextFrom(osm.value,p,radius):bundled;\n      if (!features.length && bundled.length) features=bundled;\n      renderNearby();')
+    context = context.replace('note("state-feature","");redrawn();', 'redrawn();')
     count_start = context.index('      for (const kind of Object.keys(palette))', context.index('const [osm,weather]'))
     count_end = context.index('      const current=', count_start)
     context = context[:count_start] + '      renderNearbyCounts();\n' + context[count_end:]
@@ -971,6 +972,7 @@ def upgrade_atlas_map(atlas):
   function showFeature(feature) {""", 1)
     atlas = atlas.replace('note("state-feature",feature.label+" · "+nouns[feature.kind]+" · OpenStreetMap. Current conditions unverified.");', r"""
     const target=el("state-feature");
+    target.hidden=false;
     target.textContent=feature.label+" · "+(nouns[feature.kind]||"Landmark")+" · OpenStreetMap ";
     for (const [role,label] of [["start","Set start"],["stop","Add stop"],["end","Set destination"]]) {
       const button=document.createElement("button");
