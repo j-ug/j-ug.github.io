@@ -2,10 +2,28 @@
 
 from html import escape
 from pathlib import Path
+import shutil
+import subprocess
 
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+
+.safelink-has-dock { background-color: #f6efe4; color: #24201d; }
+.safelink-has-dock #intro { position: relative; isolation: isolate; background: #f5e9d9; color: #352322; border-block: 1px solid #b99b87; }
+.safelink-has-dock #intro::before { content: ""; position: absolute; inset: clamp(7px, 2vw, 24px); border: 1px solid #ad8a75; pointer-events: none; z-index: -1; }
+.safelink-has-dock #brand-title { font-family: "Bodoni Moda", Georgia, serif; font-weight: 600; font-style: italic; letter-spacing: -.07em; color: #54192c; }
+.safelink-has-dock .atlas-top { background: #fcf6eb; border-bottom: 1px solid #a68176; }
+.safelink-has-dock .state-intro h2, .safelink-has-dock .ride-head h2, .safelink-has-dock .journey h1 { font-family: "Bodoni Moda", Georgia, serif; font-weight: 600; color: #54192c; }
+.safelink-has-dock .state-mapcard, .safelink-has-dock .state-card, .safelink-has-dock .j-card { border-color: #c9aea1; border-radius: 4px; box-shadow: 4px 4px 0 #e7d7ca; }
+.safelink-has-dock .ride-settings { background: #fff6e9; border: 1px solid #9c6f70; border-radius: 8px; }
+.safelink-has-dock .ride-screen { background: #271922; }
+.safelink-has-dock .ride-screen #ride-pickup, .safelink-has-dock .call-mute, .safelink-has-dock .call-replies button { color: #fff5ee; background: #472638; border-color: #b18292; }
+.safelink-has-dock .call-mute:hover, .safelink-has-dock .call-replies button:hover { background: #66374f; }
+#call-type { margin: .6rem 0; }
+#call-type:not([hidden]) { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: center; }
+#call-type input { flex: 1 1 170px; min-width: 0; padding: .6rem; background: #fff6e9; color: #271922; border: 1px solid #ad8896; border-radius: .35rem; font: inherit; }
+
 .safelink-dock { display: none; }
 .safelink-connectivity { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .9rem; margin: .1rem auto .9rem; font-size: .78rem; font-weight: 850; color: #3d4936; }
 .safelink-connectivity span { display: inline-flex; align-items: center; gap: .4rem; }
@@ -245,9 +263,13 @@ UPGRADE = r"""
   el("ride-pickup").setAttribute("role", "status");
   el("ride-pickup").classList.add("call-status");
   el("ride-pickup").insertAdjacentHTML("afterend", `
-    <div id="call-voice-tools" class="call-voice-tools" hidden>
+    <div id="call-voice-tools" class="call-voice-tools" data-tamil-clips="__TAMIL_CLIPS__" hidden>
       <button type="button" id="call-talk" class="call-mute" hidden>Tap to speak</button>
       <button type="button" id="call-mute" class="call-mute" aria-pressed="false" hidden>Mute mic</button>
+      <div id="call-type" hidden>
+        <input id="call-message" type="text" aria-label="Type what you want to say" placeholder="Type what you want to say" maxlength="160" autocomplete="off">
+        <button type="button" id="call-send" class="call-mute">Speak reply</button>
+      </div>
       <div class="call-replies" role="group" aria-label="Play a staged reply">
         <button type="button" data-line="stay">Stay on the line</button>
         <button type="button" data-line="wait">Give me a moment</button>
@@ -316,6 +338,10 @@ UPGRADE = r"""
       audio.play().catch(() => {});
       return;
     }
+    if (lang === "ta" && el("call-voice-tools").dataset.tamilClips === "true") {
+      playTamil(key, text);
+      return;
+    }
     if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) return;
     const voice = speechSynthesis.getVoices().find(candidate => candidate.localService && candidate.lang.toLowerCase().startsWith(lang));
     if (!voice) return;
@@ -337,16 +363,46 @@ UPGRADE = r"""
     [/\b(bye|goodbye|thanks)\b|நன்றி/i,
       "Okay, talk soon.", "சரி, அப்புறம் பேசலாம்."],
   ];
+  const typed = el("call-type"), messageField = el("call-message");
+  function speakReply(text, tamil) {
+    if (!window.SpeechSynthesisUtterance || !window.speechSynthesis) return;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = tamil ? "ta-IN" : "en-IN";
+    const voice = speechSynthesis.getVoices().find(item => item.lang.toLowerCase().split(/[-_]/)[0] === (tamil ? "ta" : "en"));
+    if (voice) utterance.voice = voice;
+    speechSynthesis.speak(utterance);
+  }
+  function playTamil(key, text) {
+    audio.src = new URL("safelink-ta-" + key + ".wav", base).href;
+    audio.play().catch(() => { if (screen.open && plan?.lang === "ta") speakReply(text, true); });
+  }
   function replyToSpeech(text, tamil) {
-    const message = responses.find(([pattern]) => pattern.test(text))?.[tamil ? 2 : 1] ||
+    const match = responses.findIndex(([pattern]) => pattern.test(text));
+    const message = responses[match]?.[tamil ? 2 : 1] ||
       (tamil ? "கேட்குது. எங்கே சந்திக்கணும், எப்போ வருவேன், அல்லது லைனில் இருக்கணுமான்னு கேளுங்க." :
         "I hear you. Ask where to meet, how long I'll be, or ask me to stay on the line.");
     el("call-caption").textContent = message;
     el("call-caption").lang = tamil ? "ta" : "en";
-    const utterance = new SpeechSynthesisUtterance(message);
-    utterance.lang = tamil ? "ta-IN" : "en-IN";
-    speechSynthesis.speak(utterance);
+    pauseVoice();
+    if (tamil && el("call-voice-tools").dataset.tamilClips === "true") {
+      playTamil(match < 0 ? "prompt" : "intent-" + match, message);
+    } else {
+      speakReply(message, tamil);
+    }
   }
+  function sendTyped() {
+    if (plan?.mode !== "browser" || !messageField.value.trim()) return;
+    stopListening();
+    el("ride-pickup").textContent = "Interactive voice · reply";
+    replyToSpeech(messageField.value.trim(), plan.lang === "ta");
+    messageField.value = "";
+  }
+  el("call-send").addEventListener("click", sendTyped);
+  messageField.addEventListener("keydown", event => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    event.preventDefault();
+    sendTyped();
+  });
   talk.addEventListener("click", () => {
     if (!plan || plan.mode !== "browser" || listener || !Recognition) return;
     pauseVoice();
@@ -366,7 +422,7 @@ UPGRADE = r"""
       replyToSpeech(event.results[0][0].transcript, tamil);
     };
     active.onerror = () => {
-      if (listener === active) label.textContent = "Speech unavailable. Check microphone access or use the replies below.";
+      if (listener === active) label.textContent = "Speech recognition stalled. Type what you want to say or tap to retry.";
       done();
     };
     active.onend = () => {
@@ -387,6 +443,8 @@ UPGRADE = r"""
   function wipeSession() {
     stopListening();
     talk.hidden = true;
+    typed.hidden = true;
+    messageField.value = "";
     session?.abort();
     session = null;
     mute = null;
@@ -423,8 +481,9 @@ UPGRADE = r"""
       if (hello) say("hello");
     };
     if (selected.mode === "browser") {
-      const supported = !!(Recognition && window.speechSynthesis && window.SpeechSynthesisUtterance);
-      fallback(supported ? "Interactive voice · tap to speak" : "Interactive voice needs a supported browser. Use the replies below.", true);
+      const supported = !!Recognition;
+      typed.hidden = false;
+      fallback(supported ? "Interactive voice · tap to speak" : "Speech recognition is unavailable. Type what you want to say.", true);
       talk.hidden = !supported;
       return;
     }
@@ -520,7 +579,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v1:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v2:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -570,8 +629,8 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v1:" + home.pathname;
-const assetURLs = [new URL("mic-worklet.js?v=1", home).href];
+const cacheKey = "safelink-kit-v2:" + home.pathname;
+const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
 self.addEventListener("install", event => {
@@ -614,10 +673,27 @@ site_base = 'new URL("./", location.href)'
 asset_base = 'new URL("./", document.currentScript.src)'
 voice_endpoint = escape(VOICE_ENDPOINT, quote=True)
 live = LIVE.replace(asset_base, site_base)
-upgrade = UPGRADE.replace(asset_base, site_base).replace('new URL("../", base)', 'base')
+tamil_lines = {
+    "hello": "ஹலோ, நான் பேசுறேன். கேட்குதா?",
+    "stay": "சரி, நான் லைனிலேயே இருக்கேன்.",
+    "wait": "அவசரம் இல்லை. நான் லைனில் இருக்கேன்.",
+    "bye": "சரி, அப்புறம் பேசலாம்.",
+    "intent-0": "வெளிச்சம் இருக்கும் பிரதான வாசல் பக்கம் சந்திப்போம்.",
+    "intent-1": "இன்னும் ஐந்து நிமிஷம். அதுவரை லைனில் இருக்கேன்.",
+    "intent-2": "சரி, அவசரம் இல்லை. நான் லைனில் இருக்கேன்.",
+    "intent-3": "சரி, அப்புறம் பேசலாம்.",
+    "prompt": "கேட்குது. எங்கே சந்திக்கணும், எப்போ வருவேன், அல்லது லைனில் இருக்கணுமான்னு கேளுங்க.",
+}
+tamil_assets = []
+if shutil.which("espeak-ng"):
+    for key, line in tamil_lines.items():
+        filename = f"safelink-ta-{key}.wav"
+        subprocess.run(["espeak-ng", "-v", "ta", "-s", "145", "-w", filename, line], check=True)
+        tamil_assets.append(filename)
+upgrade = UPGRADE.replace("__TAMIL_CLIPS__", str(bool(tamil_assets)).lower()).replace(asset_base, site_base).replace('new URL("../", base)', 'base')
 scripts = f'<script>{CLIPS}</script><script>{live}</script><script data-voice-endpoint="{voice_endpoint}">{upgrade}</script>'
-atlas = atlas.replace("</head>", f"<style>{STYLE}</style>\n</head>", 1)
+atlas = atlas.replace("</head>", f'<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,600;1,600&amp;display=swap"><style>{STYLE}</style>\n</head>', 1)
 atlas = atlas.replace("</body>", scripts + "\n</body>", 1)
 app.write_text(atlas, encoding="utf-8")
 Path("mic-worklet.js").write_text(WORKLET, encoding="utf-8")
-Path("safelink-sw.js").write_text(OFFLINE, encoding="utf-8")
+Path("safelink-sw.js").write_text(OFFLINE.replace("__TAMIL_ASSETS__", repr(tamil_assets)), encoding="utf-8")
