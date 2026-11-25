@@ -8,13 +8,33 @@ import subprocess
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+.safelink-has-dock, .safelink-has-dock * { font-family: "Nunito", sans-serif !important; }
+.safelink-has-dock #brand-title { font-weight: 900; }
+.atlas-sub { position: relative; }
+.atlas-sub[data-typing="true"] { color: transparent !important; }
+.atlas-sub[data-typing="true"]::after { content: attr(data-visible-copy); position: absolute; inset: 0; color: #54192c; }
+#intro .atlas-graphic .atlas-piece { animation: safelink-piece-in 1.85s both; }
+#intro .atlas-piece:nth-child(2) { --piece-x: -36px; --piece-y: 20px; animation-delay: .18s; }
+#intro .atlas-piece:nth-child(3) { --piece-x: 34px; --piece-y: -25px; animation-delay: .34s; }
+#intro .atlas-piece:nth-child(4) { --piece-x: 8px; --piece-y: 28px; animation-delay: .5s; }
+@keyframes safelink-piece-in {
+  from { opacity: 0; translate: var(--piece-x, -24px) var(--piece-y, -25px); scale: .82; }
+  to { translate: 0 0; scale: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #intro .atlas-graphic .atlas-piece { animation: none; }
+}
+#call-replay:not([hidden]) { margin-top: .45rem; }
+#call-audio-state { display: block; color: #f3d9df; font-size: .82rem; }
+#call-audio-state:empty { display: none; }
+
 
 .safelink-has-dock { background-color: #f6efe4; color: #24201d; }
 .safelink-has-dock #intro { position: relative; isolation: isolate; background: #f5e9d9; color: #352322; border-block: 1px solid #b99b87; }
 .safelink-has-dock #intro::before { content: ""; position: absolute; inset: clamp(7px, 2vw, 24px); border: 1px solid #ad8a75; pointer-events: none; z-index: -1; }
-.safelink-has-dock #brand-title { font-family: "Bodoni Moda", Georgia, serif; font-weight: 600; font-style: italic; letter-spacing: -.07em; color: #54192c; }
+.safelink-has-dock #brand-title { font-family: "Nunito", sans-serif; font-weight: 600; font-style: italic; letter-spacing: -.07em; color: #54192c; }
 .safelink-has-dock .atlas-top { background: #fcf6eb; border-bottom: 1px solid #a68176; }
-.safelink-has-dock .state-intro h2, .safelink-has-dock .ride-head h2, .safelink-has-dock .journey h1 { font-family: "Bodoni Moda", Georgia, serif; font-weight: 600; color: #54192c; }
+.safelink-has-dock .state-intro h2, .safelink-has-dock .ride-head h2, .safelink-has-dock .journey h1 { font-family: "Nunito", sans-serif; font-weight: 600; color: #54192c; }
 .safelink-has-dock .state-mapcard, .safelink-has-dock .state-card, .safelink-has-dock .j-card { border-color: #c9aea1; border-radius: 4px; box-shadow: 4px 4px 0 #e7d7ca; }
 .safelink-has-dock .ride-settings { background: #fff6e9; border: 1px solid #9c6f70; border-radius: 8px; }
 .safelink-has-dock .ride-screen { background: #271922; }
@@ -276,6 +296,8 @@ UPGRADE = r"""
         <button type="button" data-line="bye">Talk soon</button>
       </div>
       <p id="call-caption" class="call-caption" role="status"></p>
+      <button type="button" id="call-replay" class="call-mute" hidden>Replay reply</button>
+      <small id="call-audio-state" role="status"></small>
     </div>`);
   el("ride-ring").closest("label").insertAdjacentHTML("beforebegin", `
     <div class="ride-fields call-options">
@@ -364,15 +386,37 @@ UPGRADE = r"""
       "Okay, talk soon.", "சரி, அப்புறம் பேசலாம்."],
   ];
   const typed = el("call-type"), messageField = el("call-message");
+  const replay = el("call-replay"), audioState = el("call-audio-state");
+  let repeatReply;
+  function setReplay(play) {
+    repeatReply = play;
+    replay.hidden = false;
+  }
+  replay.addEventListener("click", () => { if (screen.open) repeatReply?.(); });
+  audio.addEventListener("timeupdate", () => {
+    if (!audio.paused && audio.currentTime > .08 && audio.src.includes("/safelink-ta-"))
+      audioState.textContent = "Tamil audio playing";
+  });
+  audio.addEventListener("ended", () => {
+    if (audio.src.includes("/safelink-ta-")) audioState.textContent = "Tamil audio played";
+  });
   function speakReply(text, tamil) {
+    setReplay(() => { pauseVoice(); speakReply(text, tamil); });
     if (!window.SpeechSynthesisUtterance || !window.speechSynthesis) return;
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = tamil ? "ta-IN" : "en-IN";
+    utterance.onstart = () => { audioState.textContent = "Voice reply playing"; };
+    utterance.onend = () => { audioState.textContent = "Voice reply played"; };
+    utterance.onerror = event => {
+      if (!["canceled", "interrupted"].includes(event.error)) audioState.textContent = "Device voice unavailable. Read the reply above.";
+    };
     const voice = speechSynthesis.getVoices().find(item => item.lang.toLowerCase().split(/[-_]/)[0] === (tamil ? "ta" : "en"));
     if (voice) utterance.voice = voice;
     speechSynthesis.speak(utterance);
   }
   function playTamil(key, text) {
+    setReplay(() => { pauseVoice(); playTamil(key, text); });
+    audioState.textContent = "Loading Tamil audio…";
     audio.src = new URL("safelink-ta-" + key + ".wav", base).href;
     audio.play().catch(() => { if (screen.open && plan?.lang === "ta") speakReply(text, true); });
   }
@@ -444,6 +488,9 @@ UPGRADE = r"""
     stopListening();
     talk.hidden = true;
     typed.hidden = true;
+    replay.hidden = true;
+    repeatReply = null;
+    audioState.textContent = "";
     messageField.value = "";
     session?.abort();
     session = null;
@@ -553,6 +600,24 @@ UPGRADE = r"""
       <span id="safelink-cache" role="status" hidden></span>
     </div>`);
   document.body.classList.add("safelink-has-dock");
+  const introCopy = document.querySelector("#intro .atlas-sub");
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+  if (introCopy && !reducedMotion.matches) {
+    const copy = Array.from(introCopy.textContent.trim());
+    let count = 0;
+    introCopy.dataset.typing = "true";
+    introCopy.dataset.visibleCopy = "";
+    const tick = () => {
+      if (reducedMotion.matches || count >= copy.length) {
+        delete introCopy.dataset.typing;
+        delete introCopy.dataset.visibleCopy;
+        return;
+      }
+      introCopy.dataset.visibleCopy = copy.slice(0, ++count).join("");
+      setTimeout(tick, 44);
+    };
+    setTimeout(tick, 230);
+  }
   for (const button of document.querySelectorAll(".safelink-dock button")) {
     button.addEventListener("click", () => {
       const jump = button.dataset.jump;
@@ -579,7 +644,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v2:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v3:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -629,7 +694,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v2:" + home.pathname;
+const cacheKey = "safelink-kit-v3:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -692,7 +757,7 @@ if shutil.which("espeak-ng"):
         tamil_assets.append(filename)
 upgrade = UPGRADE.replace("__TAMIL_CLIPS__", str(bool(tamil_assets)).lower()).replace(asset_base, site_base).replace('new URL("../", base)', 'base')
 scripts = f'<script>{CLIPS}</script><script>{live}</script><script data-voice-endpoint="{voice_endpoint}">{upgrade}</script>'
-atlas = atlas.replace("</head>", f'<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,600;1,600&amp;display=swap"><style>{STYLE}</style>\n</head>', 1)
+atlas = atlas.replace("</head>", f'<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;0,800;0,900;1,800&amp;display=swap"><style>{STYLE}</style>\n</head>', 1)
 atlas = atlas.replace("</body>", scripts + "\n</body>", 1)
 app.write_text(atlas, encoding="utf-8")
 Path("mic-worklet.js").write_text(WORKLET, encoding="utf-8")
