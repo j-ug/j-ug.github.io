@@ -246,6 +246,7 @@ UPGRADE = r"""
   el("ride-pickup").classList.add("call-status");
   el("ride-pickup").insertAdjacentHTML("afterend", `
     <div id="call-voice-tools" class="call-voice-tools" hidden>
+      <button type="button" id="call-talk" class="call-mute" hidden>Tap to speak</button>
       <button type="button" id="call-mute" class="call-mute" aria-pressed="false" hidden>Mute mic</button>
       <div class="call-replies" role="group" aria-label="Play a staged reply">
         <button type="button" data-line="stay">Stay on the line</button>
@@ -257,6 +258,7 @@ UPGRADE = r"""
   el("ride-ring").closest("label").insertAdjacentHTML("beforebegin", `
     <div class="ride-fields call-options">
       <label for="call-mode">Voice<select id="call-mode">
+        <option value="browser">Interactive voice</option>
         <option value="offline">Offline replies</option>
         <option value="live">Gemini Live</option>
         <option value="silent">Silent screen</option>
@@ -286,7 +288,7 @@ UPGRADE = r"""
     if (!live && language.value === "mixed") language.value = "en";
     el("call-setup-note").textContent = live
       ? (endpoint ? "Live voice uses internet. Offline replies are available if the connection drops." : "Gemini Live is awaiting server setup. This call will use offline replies.")
-      : mode.value === "offline" && language.value === "ta" ? "Tamil audio needs a Tamil voice installed. Replies also appear on screen." : "";
+      : mode.value === "offline" && language.value === "ta" ? "Tamil audio needs a Tamil voice installed. Replies also appear on screen." : mode.value === "browser" ? "Tap to speak after answering. Your browser may process speech online. Use fictional details." : "";
   }
   const preview = el("call-preview");
   preview.addEventListener("change", () => {
@@ -322,7 +324,69 @@ UPGRADE = r"""
     utterance.lang = voice.lang;
     speechSynthesis.speak(utterance);
   }
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let listener;
+  const talk = el("call-talk");
+  const responses = [
+    [/\b(where|location|pickup|pick up)\b|எங்க|இடம்/i,
+      "Let's meet at the main entrance, near the lights.", "வெளிச்சம் இருக்கும் பிரதான வாசல் பக்கம் சந்திப்போம்."],
+    [/\b(when|how long|minutes?|eta)\b|எப்ப|நிமிஷ/i,
+      "About five minutes. I'll stay on the line while you wait.", "இன்னும் ஐந்து நிமிஷம். அதுவரை லைனில் இருக்கேன்."],
+    [/\b(wait|stay|hold)\b|இரு|காத்து/i,
+      "Sure. Take your time. I'm right here.", "சரி, அவசரம் இல்லை. நான் லைனில் இருக்கேன்."],
+    [/\b(bye|goodbye|thanks)\b|நன்றி/i,
+      "Okay, talk soon.", "சரி, அப்புறம் பேசலாம்."],
+  ];
+  function replyToSpeech(text, tamil) {
+    const message = responses.find(([pattern]) => pattern.test(text))?.[tamil ? 2 : 1] ||
+      (tamil ? "கேட்குது. எங்கே சந்திக்கணும், எப்போ வருவேன், அல்லது லைனில் இருக்கணுமான்னு கேளுங்க." :
+        "I hear you. Ask where to meet, how long I'll be, or ask me to stay on the line.");
+    el("call-caption").textContent = message;
+    el("call-caption").lang = tamil ? "ta" : "en";
+    const utterance = new SpeechSynthesisUtterance(message);
+    utterance.lang = tamil ? "ta-IN" : "en-IN";
+    speechSynthesis.speak(utterance);
+  }
+  talk.addEventListener("click", () => {
+    if (!plan || plan.mode !== "browser" || listener || !Recognition) return;
+    pauseVoice();
+    const active = new Recognition();
+    const tamil = plan.lang === "ta";
+    active.lang = tamil ? "ta-IN" : "en-IN";
+    active.interimResults = false;
+    const label = el("ride-pickup");
+    const done = () => {
+      if (listener !== active) return;
+      listener = null;
+      talk.disabled = false;
+    };
+    active.onresult = event => {
+      if (listener !== active) return;
+      label.textContent = "Interactive voice · reply";
+      replyToSpeech(event.results[0][0].transcript, tamil);
+    };
+    active.onerror = () => {
+      if (listener === active) label.textContent = "Speech unavailable. Check microphone access or use the replies below.";
+      done();
+    };
+    active.onend = () => {
+      if (listener === active && label.textContent === "Listening…") label.textContent = "No speech heard. Tap to try again.";
+      done();
+    };
+    listener = active;
+    talk.disabled = true;
+    label.textContent = "Listening…";
+    try { active.start(); } catch { active.onerror(); }
+  });
+  function stopListening() {
+    const active = listener;
+    listener = null;
+    talk.disabled = false;
+    active?.abort();
+  }
   function wipeSession() {
+    stopListening();
+    talk.hidden = true;
     session?.abort();
     session = null;
     mute = null;
@@ -358,6 +422,12 @@ UPGRADE = r"""
       screen.removeAttribute("data-live");
       if (hello) say("hello");
     };
+    if (selected.mode === "browser") {
+      const supported = !!(Recognition && window.speechSynthesis && window.SpeechSynthesisUtterance);
+      fallback(supported ? "Interactive voice · tap to speak" : "Interactive voice needs a supported browser. Use the replies below.", true);
+      talk.hidden = !supported;
+      return;
+    }
     if (selected.mode !== "live" || !endpoint || !navigator.onLine || !window.safeLinkLiveVoice) {
       fallback("Offline replies", true);
       return;
@@ -399,6 +469,7 @@ UPGRADE = r"""
   screen.addEventListener("close", () => { if (!screen.open) wipeSession(); });
   window.addEventListener("pagehide", wipeSession);
   document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopListening();
     if (!document.hidden || !session || session.signal.aborted) return;
     session.abort();
     mute = null;
