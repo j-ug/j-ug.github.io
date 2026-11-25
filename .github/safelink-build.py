@@ -8,6 +8,15 @@ import subprocess
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+#state-view select[aria-label="Map view"], #state-view select[aria-label="Nearby radius"] { padding: .4rem; color: #352322; background: #fff6e9; border: 1px solid #aa857c; border-radius: 5px; }
+.safelink-nearby { max-height: 15rem; overflow: auto; padding-inline-start: 1.4rem; }
+.safelink-nearby:empty { display: none; }
+.safelink-nearby li { padding: .25rem 0; }
+.safelink-nearby button { font: inherit; cursor: pointer; color: inherit; text-align: left; }
+.safelink-nearby a { margin-inline-start: .55rem; font-size: .78em; }
+.safelink-imagery-credit { display: block; font-size: .68rem; }
+.safelink-imagery-credit[hidden] { display: none; }
+
 .safelink-has-dock, .safelink-has-dock * { font-family: "Nunito", sans-serif !important; }
 .safelink-has-dock #brand-title { font-weight: 900; }
 .atlas-sub { position: relative; }
@@ -644,7 +653,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v3:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v4:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -694,7 +703,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v3:" + home.pathname;
+const cacheKey = "safelink-kit-v4:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -729,10 +738,153 @@ self.addEventListener("fetch", event => {
 });
 """
 
+def upgrade_atlas_map(atlas):
+    start = atlas.index('  function contextFrom(json) {')
+    end = atlas.index('  for (const key of ["start","end"])', start)
+    context = atlas[start:end]
+    left = context.index('  function contextFrom')
+    right = context.index('  async function nearby()', left)
+    context = context[:left] + r"""
+  const nearbyRadius = document.createElement("select");
+  nearbyRadius.setAttribute("aria-label", "Nearby radius");
+  for (const km of [1.5, 3, 5]) nearbyRadius.add(new Option(km + " km", String(km * 1000), false, km === 3));
+  el("state-refresh").before(nearbyRadius);
+  const nearbyPlaces = document.createElement("ol");
+  nearbyPlaces.className = "safelink-nearby";
+  nearbyPlaces.setAttribute("aria-label", "Nearest mapped places");
+  el("state-feature").after(nearbyPlaces);
+
+  function distanceMeters(a,b) {
+    const rad = Math.PI / 180;
+    const h = Math.sin((b[1]-a[1])*rad/2)**2 +
+      Math.cos(a[1]*rad)*Math.cos(b[1]*rad)*Math.sin((b[0]-a[0])*rad/2)**2;
+    return 12742000 * Math.asin(Math.sqrt(Math.min(1,h)));
+  }
+  function contextFrom(json, centre, radius) {
+    const candidates = (Array.isArray(json?.elements) ? json.elements : []).flatMap(item => {
+      const tags = item.tags || {};
+      const point = [item.lon ?? item.center?.lon, item.lat ?? item.center?.lat];
+      if (!point.every(Number.isFinite)) return [];
+      const distance = distanceMeters(centre, point);
+      if (distance > radius) return [];
+      const kind = tags.highway === "street_lamp" ? "lights" : tags.amenity === "police" ? "police" :
+        /^(hospital|clinic|doctors|pharmacy)$/.test(tags.amenity) || tags.healthcare ? "health" : "transit";
+      const subtype = tags.amenity || (tags.highway === "bus_stop" ? "bus stop" : tags.healthcare || tags.railway || tags.public_transport);
+      const name = tags["name:en"] || tags.name || tags["name:ta"];
+      const label = String(name || (kind === "lights" ? nouns[kind] : subtype || nouns[kind])).replaceAll("_"," ").slice(0,120);
+      return [{kind, point, label, distance, named: !!name, osm: "https://www.openstreetmap.org/" + item.type + "/" + item.id}];
+    }).sort((a,b) => a.distance-b.distance);
+    const unique = [];
+    for (const place of candidates) {
+      if (place.named && unique.some(other => other.kind === place.kind && other.label.toLowerCase() === place.label.toLowerCase() &&
+        Math.abs(other.distance-place.distance) < 80 && distanceMeters(other.point,place.point) < 80)) continue;
+      unique.push(place);
+    }
+    return [...unique.filter(place => place.kind !== "lights").slice(0,180), ...unique.filter(place => place.kind === "lights").slice(0,100)];
+  }
+  function contextQuery([x,y], radius) {
+    const near = "(around:" + radius + "," + y.toFixed(5) + "," + x.toFixed(5) + ")";
+    const lampArea = "(around:" + Math.min(radius,1600) + "," + y.toFixed(5) + "," + x.toFixed(5) + ")";
+    return '[out:json][timeout:12];(nwr["amenity"~"^(hospital|clinic|doctors|pharmacy|police|bus_station|taxi)$"]'+near+
+      ';nwr["healthcare"~"^(hospital|clinic|doctor|doctors|pharmacy)$"]'+near+
+      ';nwr["railway"~"^(station|halt)$"]'+near+';node["highway"="bus_stop"]'+near+
+      ';nwr["public_transport"="station"]'+near+';);out center 700;node["highway"="street_lamp"]'+lampArea+';out body 350;';
+  }
+  async function findNearbyData(point, radius) {
+    const query = "?data=" + encodeURIComponent(contextQuery(point,radius));
+    try {
+      return await fetchJson("https://overpass.private.coffee/api/interpreter"+query,14);
+    } catch {
+      return fetchJson("https://overpass-api.de/api/interpreter"+query,14);
+    }
+  }
+  function renderNearby() {
+    nearbyPlaces.replaceChildren();
+    const places = features.filter(place => place.kind !== "lights").slice(0,12);
+    for (const place of places) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = place.label + " · " + (place.distance < 1000 ? Math.round(place.distance) + " m" : (place.distance/1000).toFixed(1) + " km");
+      button.addEventListener("click", () => {
+        if (streetReady) map.easeTo({center:place.point,zoom:Math.max(map.getZoom(),15)});
+        else { [lng,lat] = place.point; invalidate(); }
+        showFeature(place);
+      });
+      const source = document.createElement("a");
+      source.href = place.osm;
+      source.target = "_blank";
+      source.rel = "noopener";
+      source.textContent = "OSM";
+      source.setAttribute("aria-label","Open " + place.label + " on OpenStreetMap");
+      item.append(button,source);
+      nearbyPlaces.append(item);
+    }
+  }
+""" + context[right:]
+    context = context.replace('    contextPending=true;', '    const radius=Number(nearbyRadius.value);\n    nearbyRadius.disabled=true;\n    contextPending=true;', 1)
+    context = context.replace('p.map(v=>v.toFixed(3)).join(",")', 'p.map(v=>v.toFixed(5)).join(",")+":"+radius', 1)
+    request_start = context.index('        const urls=[')
+    request_end = context.index('        if (result.values', request_start)
+    context = context[:request_start] + r"""
+        const weatherUrl="https://api.open-meteo.com/v1/forecast?"+point+"&current=temperature_2m,precipitation,wind_speed_10m&timezone=Asia%2FKolkata";
+        result={values:await Promise.allSettled([findNearbyData(p,radius),fetchJson(weatherUrl,13)]),time:Date.now()};
+""" + context[request_end:]
+    context = context.replace('result.values.every(value=>value.status==="fulfilled")', 'result.values[0].status==="fulfilled"')
+    context = context.replace('contextFrom(osm.value):[];', 'contextFrom(osm.value,p,radius):[];\n      renderNearby();')
+    context = context.replace('"Mapped points within 1.8 km of the selected centre (up to 180). Select a dot for details."', '"OpenStreetMap places within "+radius/1000+" km of the queried centre. Distances are straight-line. Lamp coverage is sampled within 1.6 km."')
+    context = context.replace('contextPending=false;refreshControls();','nearbyRadius.disabled=false;contextPending=false;refreshControls();')
+    atlas = atlas[:start] + context + atlas[end:]
+    anchor = '  function resizeAndLoad() {'
+    return atlas.replace(anchor, r"""
+  const baseStyle = document.createElement("select");
+  baseStyle.setAttribute("aria-label", "Map view");
+  for (const [name,label] of [["street","Street"],["satellite","Satellite"],["hybrid","Hybrid"]])
+    baseStyle.add(new Option(label,name));
+  const imageryCredit = document.createElement("a");
+  imageryCredit.href = "https://goto.arcgisonline.com/maps/World_Imagery";
+  imageryCredit.target = "_blank";
+  imageryCredit.rel = "noopener";
+  imageryCredit.textContent = "Imagery © Esri, Vantor, Earthstar Geographics and GIS User Community";
+  imageryCredit.hidden = true;
+  imageryCredit.className = "safelink-imagery-credit";
+  el("state-fit").after(baseStyle);
+  el("state-live-source").after(imageryCredit);
+  const backdrop = "safelink-imagery";
+  let baseLayers = [];
+  function prepareImagery(target) {
+    baseLayers = target.getStyle().layers.map(layer => [layer.id, layer.type, layer.layout?.visibility || "visible"]);
+    target.addSource(backdrop, {
+      type:"raster", tileSize:256, maxzoom:19,
+      tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"]
+    });
+    const firstLabel = baseLayers.find(([,type]) => type === "symbol")?.[0];
+    target.addLayer({id:backdrop,type:"raster",source:backdrop,layout:{visibility:"none"}}, firstLabel);
+  }
+  function chooseBasemap() {
+    const style = baseStyle.value;
+    if (!streetReady || !map.getLayer(backdrop)) {
+      imageryCredit.hidden = true;
+      if (style !== "street") note("state-mapnote","Imagery needs the online map. Start and destination can still be picked on the overview.");
+      return;
+    }
+    for (const [id,type,visibility] of baseLayers) {
+      map.setLayoutProperty(id,"visibility",style === "street" || (style === "hybrid" && type === "symbol") ? visibility : "none");
+    }
+    map.setLayoutProperty(backdrop,"visibility",style === "street" ? "none" : "visible");
+    imageryCredit.hidden = style === "street";
+    setMode(style === "street" ? "Live street map" : style === "hybrid" ? "Hybrid map" : "Satellite map",true);
+  }
+  baseStyle.addEventListener("change",chooseBasemap);
+  window.addEventListener("offline", () => { imageryCredit.hidden = true; });
+""" + anchor, 1).replace('          installLayer(target);','          prepareImagery(target);\n          installLayer(target);',1).replace('          setMode("Live street map",true);','          chooseBasemap();',1)
+
 app = Path("index.html")
 atlas = app.read_text(encoding="utf-8")
 if "<!doctype html>" not in atlas.lower() or atlas.count("</head>") != 1 or atlas.count("</body>") != 1:
     raise SystemExit("Expected a standalone atlas in index.html")
+
+atlas = upgrade_atlas_map(atlas)
 
 site_base = 'new URL("./", location.href)'
 asset_base = 'new URL("./", document.currentScript.src)'
