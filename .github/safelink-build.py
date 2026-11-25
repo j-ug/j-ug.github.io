@@ -8,6 +8,11 @@ import subprocess
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+#call-level { display: block; width: min(220px,90%); height: 16px; margin: .45rem auto; }
+#call-level[hidden] { display: none; }
+.safelink-place-label { color:#352322; background:#fff9ed; border:1px solid #82545f; border-radius:5px; padding:3px 5px; cursor:pointer; max-width:150px; text-overflow:ellipsis; white-space:nowrap; overflow:hidden; }
+.safelink-stops button { margin-inline-end:.4rem; }
+
 #state-view select[aria-label="Map view"], #state-view select[aria-label="Nearby radius"] { padding: .4rem; color: #352322; background: #fff6e9; border: 1px solid #aa857c; border-radius: 5px; }
 .safelink-nearby { max-height: 15rem; overflow: auto; padding-inline-start: 1.4rem; }
 .safelink-nearby:empty { display: none; }
@@ -295,6 +300,7 @@ UPGRADE = r"""
     <div id="call-voice-tools" class="call-voice-tools" data-tamil-clips="__TAMIL_CLIPS__" hidden>
       <button type="button" id="call-talk" class="call-mute" hidden>Tap to speak</button>
       <button type="button" id="call-mute" class="call-mute" aria-pressed="false" hidden>Mute mic</button>
+      <meter id="call-level" min="0" max="1" value="0" aria-label="Microphone level" hidden></meter>
       <div id="call-type" hidden>
         <input id="call-message" type="text" aria-label="Type what you want to say" placeholder="Type what you want to say" maxlength="160" autocomplete="off">
         <button type="button" id="call-send" class="call-mute">Speak reply</button>
@@ -456,41 +462,70 @@ UPGRADE = r"""
     event.preventDefault();
     sendTyped();
   });
+  const micLevel = el("call-level");
+  let recordingTimer, inputStream, inputAudio, levelFrame;
+  function endLevel() {
+    cancelAnimationFrame(levelFrame);
+    inputStream?.getTracks().forEach(track => track.stop());
+    inputAudio?.close().catch(() => {});
+    inputStream = inputAudio = null;
+    micLevel.value = 0;
+    micLevel.hidden = true;
+  }
+  async function measureLevel(active) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext || !navigator.mediaDevices?.getUserMedia) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+      if (listener !== active) { stream.getTracks().forEach(track => track.stop()); return; }
+      inputStream = stream;
+      inputAudio = new AudioContext();
+      const analyser = inputAudio.createAnalyser();
+      analyser.fftSize = 256;
+      inputAudio.createMediaStreamSource(stream).connect(analyser);
+      await inputAudio.resume();
+      const samples = new Float32Array(analyser.fftSize);
+      const tick = () => {
+        if (listener !== active) return;
+        analyser.getFloatTimeDomainData(samples);
+        micLevel.hidden = false;
+        micLevel.value = Math.min(1, 6 * Math.sqrt(samples.reduce((sum,n) => sum+n*n,0)/samples.length));
+        levelFrame = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch { if (listener === active) endLevel(); }
+  }
   talk.addEventListener("click", () => {
-    if (!plan || plan.mode !== "browser" || listener || !Recognition) return;
+    if (!plan || plan.mode !== "browser" || !Recognition) return;
+    if (listener) { stopListening(); el("ride-pickup").textContent = "Tap to speak again"; return; }
     pauseVoice();
     const active = new Recognition();
     const tamil = plan.lang === "ta";
     active.lang = tamil ? "ta-IN" : "en-IN";
     active.interimResults = false;
+    active.continuous = false;
     const label = el("ride-pickup");
-    const done = () => {
+    const finish = (message, transcript) => {
       if (listener !== active) return;
-      listener = null;
-      talk.disabled = false;
+      stopListening();
+      label.textContent = message;
+      if (transcript) replyToSpeech(transcript,tamil);
     };
-    active.onresult = event => {
-      if (listener !== active) return;
-      label.textContent = "Interactive voice · reply";
-      replyToSpeech(event.results[0][0].transcript, tamil);
-    };
-    active.onerror = () => {
-      if (listener === active) label.textContent = "Speech recognition stalled. Type what you want to say or tap to retry.";
-      done();
-    };
-    active.onend = () => {
-      if (listener === active && label.textContent === "Listening…") label.textContent = "No speech heard. Tap to try again.";
-      done();
-    };
+    active.onresult = event => finish("Interactive voice · reply",event.results[0][0].transcript);
+    active.onerror = () => finish("Speech recognition stalled. Try again or type your question.");
+    active.onend = () => finish("No speech heard. Tap to try again.");
     listener = active;
-    talk.disabled = true;
+    talk.textContent = "Stop listening";
     label.textContent = "Listening…";
-    try { active.start(); } catch { active.onerror(); }
+    recordingTimer = setTimeout(() => finish("Listening timed out. Tap to try again."),11000);
+    try { active.start(); measureLevel(active); } catch { active.onerror(); }
   });
   function stopListening() {
     const active = listener;
     listener = null;
-    talk.disabled = false;
+    clearTimeout(recordingTimer);
+    endLevel();
+    talk.textContent = "Tap to speak";
     active?.abort();
   }
   function wipeSession() {
@@ -653,7 +688,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v4:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v5:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -703,7 +738,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v4:" + home.pathname;
+const cacheKey = "safelink-kit-v5:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -886,6 +921,74 @@ def upgrade_atlas_map(atlas):
     context = context.replace('"Mapped points within 1.8 km of the selected centre (up to 180). Select a dot for details."', '"OpenStreetMap places within "+radius/1000+" km of the queried centre. Distances are straight-line. Lamp coverage is sampled within 1.6 km."')
     context = context.replace('contextPending=false;refreshControls();','nearbyRadius.disabled=false;nearbyArea.disabled=false;contextPending=false;refreshControls();')
     atlas = atlas[:start] + context + atlas[end:]
+    atlas = atlas.replace('  function showFeature(feature) {', r"""
+  const stops = [];
+  let namedStart = "", namedEnd = "";
+  const stopList = document.createElement("div");
+  stopList.className = "safelink-stops";
+  stopList.setAttribute("aria-label","Route stops");
+  el("state-end").after(stopList);
+  el("state-clear").addEventListener("click", () => {
+    stops.length=0; namedStart=""; namedEnd=""; renderStops(); refreshControls();
+  });
+  function renderStops() {
+    stopList.replaceChildren();
+    stops.forEach((stop,index) => {
+      const button=document.createElement("button");
+      button.type="button"; button.textContent=(index+1)+". "+stop.label+" ×";
+      button.setAttribute("aria-label","Remove stop "+stop.label);
+      button.onclick=()=>{ stops.splice(index,1); clearRoute(); renderStops(); refreshControls(); redrawn(); };
+      stopList.append(button);
+    });
+  }
+  function setPlace(feature, role) {
+    if (!inState(feature.point)) return;
+    if (role==="stop") {
+      if (stops.length>=5 || stops.some(stop=>stop.osm===feature.osm)) return;
+      stops.push(feature); renderStops();
+    } else {
+      setPicking(role); pick(feature.point);
+      if (role==="start") namedStart=feature.label;
+      else namedEnd=feature.label;
+    }
+    clearRoute(); refreshControls(); redrawn();
+  }
+  let placeLabels = [];
+  function drawPlaceLabels() {
+    placeLabels.forEach(marker=>marker.remove());
+    placeLabels=[];
+    if (!streetReady || map.getZoom()<12) return;
+    const candidates = features.filter(place=>place.kind!=="lights" && place.named!==false);
+    for (const place of candidates.slice(0,12)) {
+      const button=document.createElement("button");
+      button.type="button";
+      button.className="safelink-place-label";
+      button.textContent=place.label;
+      button.onclick=event=>{event.stopPropagation(); if(picking) pick(place.point); else showFeature(place);};
+      placeLabels.push(new maplibregl.Marker({element:button,anchor:"bottom",offset:[0,-6]}).setLngLat(place.point).addTo(map));
+    }
+  }
+  function showFeature(feature) {""", 1)
+    atlas = atlas.replace('note("state-feature",feature.label+" · "+nouns[feature.kind]+" · OpenStreetMap. Current conditions unverified.");', r"""
+    const target=el("state-feature");
+    target.textContent=feature.label+" · "+(nouns[feature.kind]||"Landmark")+" · OpenStreetMap ";
+    for (const [role,label] of [["start","Set start"],["stop","Add stop"],["end","Set destination"]]) {
+      const button=document.createElement("button");
+      button.type="button"; button.textContent=label;
+      button.onclick=()=>setPlace(feature,role);
+      target.append(button);
+    }""", 1)
+    atlas = atlas.replace('namePoint(start);','namedStart||namePoint(start);',1).replace('namePoint(end);','namedEnd||namePoint(end);',1)
+    atlas = atlas.replace('if (picking==="start") start=point;','if (picking==="start") {start=point;namedStart="";}',1).replace('if (picking==="end") end=point;','if (picking==="end") {end=point;namedEnd="";}',1)
+    atlas = atlas.replace('[start,end].map(p=>p.map(n=>n.toFixed(5))','[start,...stops.map(stop=>stop.point),end].map(p=>p.map(n=>n.toFixed(5))',1)
+    atlas = atlas.replace('km+" km · "+travel','km+" km by "+(mode==="foot"?"walking":"road")+" · "+travel',1)
+    atlas = atlas.replace('  function installLayer(target) {','  function installLayer(target) {\n    target.on("zoomend",drawPlaceLabels);',1)
+    atlas = atlas.replace('renderNearbyCounts();','renderNearbyCounts();\n    drawPlaceLabels();')
+    atlas = atlas.replace('const kind = tags.highway === "street_lamp" ? "lights" :','const kind = tags.highway === "street_lamp" ? "lights" : tags.tourism || tags.historic || tags.amenity==="place_of_worship" ? "landmark" :',1)
+    atlas = atlas.replace("';nwr[\"public_transport\"=\"station\"]'+near+", """';nwr["tourism"~"^(attraction|museum)$"]["name"]'+near+';nwr["historic"]["name"]'+near+
+      ';nwr["amenity"="place_of_worship"]["name"]'+near+';nwr["public_transport"="station"]'+near+""",1)
+    atlas = atlas.replace(' + " m" : (place.distance/1000).toFixed(1) + " km");',' + " m" : (place.distance/1000).toFixed(1) + " km") + " direct from search centre";',1)
+
     atlas = atlas.replace('palette[feature.kind],', '(palette[feature.kind] || "#7e4775"),', 1)
     atlas = atlas.replace('color:palette[f.kind]', 'color:palette[f.kind] || "#7e4775"', 1)
     anchor = '  function resizeAndLoad() {'
