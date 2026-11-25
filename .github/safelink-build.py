@@ -3,7 +3,7 @@
 from html import escape
 from pathlib import Path
 
-VOICE_ENDPOINT = 'https://safelink-voice.jeswinsamuel-la.workers.dev/token'
+VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
 .safelink-dock { display: none; }
