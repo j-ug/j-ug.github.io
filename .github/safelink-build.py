@@ -768,7 +768,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v11:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v12:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -818,7 +818,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v11:" + home.pathname;
+const cacheKey = "safelink-kit-v12:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...["night-city.js","walk-toolkit.js","i18n-ta.json","manifest.webmanifest","safelink-icon.svg","impact.html","credits.html","night-assets/fonts.css",...__NIGHT_FILES__].map(path=>new URL(path,home).href), ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -1628,7 +1628,7 @@ def night_city_features(atlas):
     atlas = atlas.replace('lit+"/"+count+" samples tagged lit · "', 'yes+"% lit · "+no+"% unlit · "+(100-yes-no)+"% lighting unknown · "', 1)
     atlas = atlas.replace('    route=options[selected];', '''    route=options[selected];
     const best=(metric)=>options.reduce((index,option,i)=>metric(option)<metric(options[index])?i:index,0);
-    const choices=[["Shortest",best(o=>o.metres)],["Brighter mapped route",best(o=>-o.condition.litCoverage.yes)],["Fewer surface concerns",best(o=>o.condition.concernCount])];
+    const choices=[["Shortest",best(o=>o.metres)],["Brighter mapped route",best(o=>-o.condition.litCoverage.yes)],["Fewer surface concerns",best(o=>o.condition.concernCount)]];
     for(const [label,index] of choices){
       const b=document.createElement("button");b.type="button";
       b.dataset.condition=options[index].condition.green?"green":"red";
