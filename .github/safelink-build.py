@@ -8,6 +8,13 @@ import subprocess
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+.safelink-nearby { max-height:26rem; }
+.safelink-nearby details { margin:.4rem 0; padding:.35rem; border-bottom:1px solid #c9aea1; }
+.safelink-nearby button, #state-feature button { display:inline-block; min-height:44px; padding:.4rem .65rem; margin:.2rem; }
+#state-feature { scroll-margin-top:5rem; }
+.safelink-contact { padding:1.4rem; }
+.safelink-contact a { overflow-wrap:anywhere; }
+
 body.safelink-has-dock :is(h1,h2,h3,#brand-title) { font-family:Nunito,sans-serif!important; font-style:normal!important; font-weight:900!important; letter-spacing:.025em!important; color:#601d36ed!important; text-shadow:1px 1px 0 #d4a2a080,2px 2px 1px #ae688e44,0 0 8px #c7759e4d; }
 .safelink-route-choices { display:flex; flex-wrap:wrap; gap:.45rem; }
 .safelink-route-choices button { min-height:42px; padding:.5rem; color:#fff; border:2px solid transparent; border-radius:.3rem; font-weight:800; }
@@ -702,7 +709,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v7:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v8:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -752,7 +759,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v7:" + home.pathname;
+const cacheKey = "safelink-kit-v8:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -1288,12 +1295,144 @@ def upgrade_route_conditions(atlas):
     atlas = atlas.replace('target.on("zoomend",drawPlaceLabels);','target.on("zoomend",drawPlaceLabels);\n    target.on("moveend",queueNearby);',1)
     return atlas
 
+
+def organize_planner(atlas):
+    start = atlas.index('  let nearbyTimer, lastNearby')
+    end = atlas.index('  for (const key of ["start","end"])', start)
+    atlas = atlas[:start] + r"""
+  let nearbyTimer, hoverPoint, tapPoint, lastNearbyKey="", pendingKey="";
+  const nearbySnapshots=new Map();
+  const nearbyHeading=document.createElement("p");
+  nearbyHeading.textContent="Select start or destination. Otherwise tap the map on a phone or pause your pointer over the map.";
+  nearbyPlaces.before(nearbyHeading);
+  nearbyRadius.value="10000";
+  function nearbyCentres() {
+    const selected=[];
+    if(start) selected.push(["Start",start]);
+    if(end) selected.push(["Destination",end]);
+    return selected.length?selected:[[tapPoint?"Map tap":hoverPoint?"Pointer":"Map centre",tapPoint||hoverPoint||middle()]];
+  }
+  function queueNearby() {
+    clearTimeout(nearbyTimer);
+    nearbyTimer=setTimeout(()=>nearby(false),850);
+  }
+  function setNearbyPoint(point,tap) {
+    if(start||end||picking||!inState(point)) return;
+    if(tap){tapPoint=point;hoverPoint=null;nearby(true);return;}
+    if(tapPoint || (hoverPoint && distanceMeters(hoverPoint,point)<120)) return;
+    hoverPoint=point;queueNearby();
+  }
+  async function nearby(force=false) {
+    const radius=Number(nearbyRadius.value);
+    const centres=nearbyCentres().filter(([,p])=>inState(p));
+    if(!centres.length) return;
+    const key=radius+":"+centres.map(([label,p])=>label+":"+p.map(v=>v.toFixed(3)).join(",")).join(";");
+    if(!force && key===lastNearbyKey) return;
+    lastNearbyKey=key;
+    const local=centres.map(([label,p])=>({label,items:bundledNearby(p,radius),source:"Bundled OpenStreetMap"}));
+    nearbyHeading.textContent="Up to "+radius/1000+" km · straight-line distance from each search point.";
+    function publish(groups){
+      const merged=new Map();
+      groups.forEach(group=>group.items.forEach(p=>merged.set(p.osm,p)));
+      features=[...merged.values()]; renderNearby(groups); renderNearbyCounts(); drawPlaceLabels(); redrawn();
+    }
+    publish(local);
+    note("state-context-note",online()?"Loading mapped places…":"Showing bundled places.");
+    if(!online()) return;
+    if(contextPending){pendingKey=key;return;}
+    contextPending=true;
+    try {
+      const groups=await Promise.all(centres.map(async ([label,p],i)=>{
+        const cacheKey=radius+":"+p.map(v=>v.toFixed(3)).join(",");
+        try {
+          let cached=nearbySnapshots.get(cacheKey);
+          if(!cached || Date.now()-cached.time>300000){
+            const json=await findNearbyData(p,radius);
+            cached={time:Date.now(),items:contextFrom(json,p,radius)};
+            if(nearbySnapshots.size>=14) nearbySnapshots.delete(nearbySnapshots.keys().next().value);
+            nearbySnapshots.set(cacheKey,cached);
+          }
+          const union=new Map(cached.items.map(x=>[x.osm,x]));
+          local[i].items.forEach(x=>{if(!union.has(x.osm))union.set(x.osm,x);});
+          return {label,items:[...union.values()].sort((a,b)=>a.distance-b.distance),source:"OpenStreetMap online and bundled places"};
+        } catch {return local[i];}
+      }));
+      if(lastNearbyKey!==key) return;
+      publish(groups);
+      note("state-context-note",groups.every(g=>g.source.startsWith("Bundled"))?"Showing bundled places. The live lookup did not return data.":"OpenStreetMap coverage varies by area.");
+    } finally {
+      contextPending=false;
+      if(pendingKey){pendingKey="";lastNearbyKey="";queueNearby();}
+    }
+  }
+  nearbyRadius.addEventListener("change",()=>nearby(true));
+
+""" + atlas[end:]
+    start = atlas.index('  function renderNearby() {')
+    end = atlas.index('  let nearbyTimer',start)
+    atlas = atlas[:start] + r"""
+  const placeGroups=[["health","Health"],["police","Police"],["transit","Transit"],["shop","Shops"],["landmark","Landmarks"]];
+  function renderNearby(groups) {
+    nearbyPlaces.replaceChildren();
+    for(const {label,items,source} of groups){
+      const section=document.createElement("li");
+      const title=document.createElement("strong");title.textContent=label+" · "+source;section.append(title);
+      for(const [kind,name] of placeGroups){
+        const matches=items.filter(p=>(p.tags?.shop?"shop":p.kind)===kind);
+        if(!matches.length)continue;
+        const details=document.createElement("details"),summary=document.createElement("summary");
+        summary.textContent=name+" ("+matches.length+")";details.append(summary);
+        details.open=kind==="health"||kind==="landmark";
+        for(const place of matches.slice(0,25)){
+          const button=document.createElement("button");button.type="button";
+          button.textContent=place.label+" · "+(place.distance<1000?Math.round(place.distance)+" m":(place.distance/1000).toFixed(1)+" km");
+          button.onclick=()=>showFeature(place,true);
+          details.append(button);
+        }
+        section.append(details);
+      }
+      if(!items.some(p=>p.kind!=="lights")) section.append(" · No mapped places returned");
+      nearbyPlaces.append(section);
+    }
+  }
+""" + atlas[end:]
+    atlas=atlas.replace('for (const km of [1.5, 3, 5])','for (const km of [1.5, 3, 5, 10])',1)
+    atlas=atlas.replace('el("state-refresh").disabled=!online()||contextPending;', 'el("state-refresh").disabled=false;',1)
+    atlas=atlas.replace('if (hit) showFeature(features[Number(hit.properties.index)]);','if (hit) showFeature(features[Number(hit.properties.index)],true);\n      else setNearbyPoint(e.lngLat.toArray(),true);',1)
+    atlas=atlas.replace('    target.on("mousemove",e=>{','    target.on("mousemove",e=>{ if(e.originalEvent?.pointerType!=="touch") setNearbyPoint(e.lngLat.toArray(),false);',1)
+    atlas=atlas.replace('    clearRoute();setPicking("");refreshControls();redrawn();','    clearRoute();setPicking("");refreshControls();redrawn();queueNearby();',1)
+    atlas=atlas.replace('    stops.length=0; namedStart=""; namedEnd=""; renderStops(); refreshControls();','    stops.length=0; namedStart=""; namedEnd=""; tapPoint=null; hoverPoint=null; renderStops(); refreshControls(); queueNearby();',1)
+    atlas=atlas.replace('  function showFeature(feature) {','  function showFeature(feature, scroll=false) {',1)
+    atlas=atlas.replace('    target.hidden=false;\n    target.textContent=feature.label','    target.hidden=false;\n    if(scroll && matchMedia("(max-width:740px)").matches) target.scrollIntoView({block:"center"});\n    target.textContent=feature.label',1)
+    atlas=atlas.replace('    if (!streetReady || map.getZoom()<12) return;\n    const candidates = features.filter(place=>place.kind!=="lights" && place.named!==false);\n    for (const place of candidates.slice(0,12)) {',r"""
+    if (!streetReady) return;
+    const bounds=map.getBounds(), zoom=map.getZoom();
+    const known=[...localIndex.values()].filter(p=>!["Neighbourhood"].includes(p.kind));
+    const visible=new Map([...known,...(zoom>=13?features.filter(p=>p.kind!=="lights"&&p.named!==false):[])].filter(p=>bounds.contains(p.point)).map(p=>[p.osm,p]));
+    const occupied=[];
+    for (const place of visible.values()) {
+      if(occupied.length>=24)break;
+      const xy=map.project(place.point);
+      if(occupied.some(p=>Math.abs(p.x-xy.x)<105&&Math.abs(p.y-xy.y)<32))continue;
+      occupied.push(xy);""",1)
+    atlas=atlas.replace('else showFeature(place);};','else showFeature(place,true);};',1)
+    atlas=atlas.replace('target.on("moveend",queueNearby);','target.on("moveend",()=>{drawPlaceLabels();queueNearby();});',1)
+    atlas=atlas.replace('  const routeChoices = document.createElement("div");','  let visibleRoutes=[];\n  const routeChoices = document.createElement("div");',1)
+    atlas=atlas.replace('route=null;routeChoices.replaceChildren();','route=null;visibleRoutes=[];routeChoices.replaceChildren();',1)
+    atlas=atlas.replace('    route=options[selected];','    visibleRoutes=options;\n    route=options[selected];',1)
+    atlas=atlas.replace('features:route?[{type:"Feature",properties:{condition:route.condition?.green?"#188047":"#b72e42"},geometry:{type:"LineString",coordinates:route.line}}]:[]','features:[...visibleRoutes].sort((a,b)=>Number(a===route)-Number(b===route)).map(option=>({type:"Feature",properties:{condition:option.condition?.green?"#188047":"#b72e42",selected:option===route},geometry:{type:"LineString",coordinates:option.line}}))',1)
+    atlas=atlas.replace('"line-width":9,"line-color":"#fffdf1"', '"line-width":["case",["get","selected"],8,5],"line-opacity":["case",["get","selected"],1,.5],"line-color":"#fffdf1"',1)
+    atlas=atlas.replace('"line-width":4.6,"line-color":["get","condition"]','"line-width":["case",["get","selected"],4.6,3],"line-opacity":["case",["get","selected"],1,.6],"line-color":["get","condition"]',1)
+    atlas=atlas.replace('    target.on("click",e=>{','    target.on("click",e=>{',1)
+    return atlas
+
 app = Path("index.html")
 atlas = app.read_text(encoding="utf-8")
 if "<!doctype html>" not in atlas.lower() or atlas.count("</head>") != 1 or atlas.count("</body>") != 1:
     raise SystemExit("Expected a standalone atlas in index.html")
 
-atlas = upgrade_route_conditions(upgrade_atlas_map(atlas))
+atlas = organize_planner(upgrade_route_conditions(upgrade_atlas_map(atlas)))
+atlas = atlas.replace("</body>", '<footer class="safelink-contact aa-width"><h2>About SafeLink</h2><p>Founded by Eraiyanbu and Jeswin Samuel.</p><h3>Professional enquiries</h3><p><a href="mailto:jeswinsamuel.la@gmail.com">jeswinsamuel.la@gmail.com</a> · <a href="tel:+919597064942">+91 9597064942</a></p></footer></body>', 1)
 atlas = atlas.replace("</body>", '<script>const account=document.createElement("a"); account.href="account.html"; account.textContent="Account &amp; family"; const how=document.createElement("a"); how.href="how-it-works.html"; how.textContent="How SafeLink works"; document.getElementById("ride-open")?.before(how); document.getElementById("state-end")?.after(how.cloneNode(true)); document.getElementById("ride-open")?.before(account); document.getElementById("state-end")?.after(account.cloneNode(true));</script></body>', 1)
 atlas = atlas.replace("</body>", '<script>document.getElementById("robotics-tab")?.remove(); document.getElementById("main")?.setAttribute("hidden","");</script></body>', 1)
 
@@ -1328,4 +1467,4 @@ Path("safelink-sw.js").write_text(OFFLINE.replace("__TAMIL_ASSETS__", repr(tamil
 
 Path("account.html").write_text("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SafeLink Account</title>\n<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap\">\n<style>[hidden]{display:none!important}*{box-sizing:border-box}body{margin:0;background:#f6efe4;color:#351e27;font:1rem Nunito,sans-serif}main{margin:2rem auto;padding:1.25rem;width:min(42rem,95%);background:#fff8ed;border:1px solid #aa7f75}form{display:grid;gap:.65rem}label{display:grid;gap:.25rem}input,select,button,a{font:inherit}input,select,button{min-height:44px;padding:.5rem}button{background:#5a233c;color:white;border:0;border-radius:.25rem}a{color:#70243f}li{margin:.5rem 0}section{margin-top:1.5rem}h1,h2{line-height:1.1}</style>\n<main><a href=\"./\">Back to SafeLink</a><h1>SafeLink Account</h1>\n<p id=\"auth-status\" role=\"status\"></p>\n<form id=\"login\"><label>Email<input name=\"email\" type=\"email\" autocomplete=\"email\" required></label><label>Password<input name=\"password\" type=\"password\" minlength=\"8\" autocomplete=\"current-password\" required></label><button value=\"login\">Sign in</button><button value=\"signup\">Create account</button></form>\n<div id=\"member\" hidden><button id=\"logout\">Sign out</button>\n<section><h2>Family call buttons</h2><p>Saved to your account. A call opens your device’s dialler.</p><form id=\"contact\"><label>Name<input name=\"label\" maxlength=\"50\" required></label><label>Phone<input name=\"phone\" type=\"tel\" maxlength=\"18\" required></label><button>Add family member</button></form><ul id=\"contacts\"></ul></section>\n<section><h2>Local circles</h2><p>Choose a locality and share a private invite to let other SafeLink users join its board. Members see an alias and preset messages.</p>\n<form id=\"circle\"><label>Locality<select name=\"area\"><option>Central Trichy</option><option>Woraiyur</option><option>Manapparai</option><option>Srirangam</option><option>Thillai Nagar</option></select></label><label>Alias<input name=\"alias\" maxlength=\"25\" required></label><label>Circle invite<input name=\"invite\" maxlength=\"32\" placeholder=\"Leave blank to create a circle\"></label><button>Open circle</button></form>\n<div id=\"board\" hidden><p id=\"invite\"></p><form id=\"post\"><label>Message<select name=\"message\"><option>Available for a public group walk</option><option>Looking for a walking buddy</option><option>Available for a check-in</option></select></label><button>Post to circle</button></form><button id=\"refresh\">Refresh board</button> <button id=\"leave\">Leave circle</button><ul id=\"messages\"></ul></div></section></div></main>\n<script src=\"https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.86.0/dist/umd/supabase.js\"></script>\n<script>\n\"use strict\";\nconst el=id=>document.getElementById(id);\nconst status=message=>{el(\"auth-status\").textContent=message;};\nif (!window.supabase) { status(\"Sign-in needs an internet connection.\"); } else {\nconst db=supabase.createClient(\"https://mqpmbiyoxzvpuxemgvtt.supabase.co\",\"sb_publishable_TH_RZVnVW783fTSluyfpOQ_ggdxucC4\");\nlet user=null, active=null, family=[];\nfunction value(form,name){return String(new FormData(form).get(name)||\"\").trim();}\nfunction handle(form,action){el(form).addEventListener(\"submit\",async event=>{event.preventDefault();const button=event.submitter;if(button)button.disabled=true;try{await action(event);}catch(error){status(error.message||\"Request failed.\");}finally{if(button)button.disabled=false;}});}\nfunction renderContacts(){\n  el(\"contacts\").replaceChildren();\n  const saved=family;\n  for(const item of saved) {\n    if(typeof item?.label!==\"string\"||!/^\\+?[0-9]{7,15}$/.test(item.phone))continue;\n    const row=document.createElement(\"li\"),a=document.createElement(\"a\"),remove=document.createElement(\"button\");\n    a.href=\"tel:\"+item.phone;a.textContent=\"Call \"+item.label;\n    remove.textContent=\"Remove\"; remove.type=\"button\";\n    remove.onclick=async()=>{remove.disabled=true;try{const {error}=await db.from(\"safelink_family\").delete().eq(\"id\",item.id);if(error)throw error;await loadFamily();}catch(e){status(e.message);remove.disabled=false;}};\n    row.append(a,\" \",remove);el(\"contacts\").append(row);\n  }\n}\nasync function loadFamily(){const id=user?.id;if(!id)return;const {data,error}=await db.from(\"safelink_family\").select(\"id,label,phone\").order(\"label\");if(user?.id!==id)return;if(error)throw error;family=data;renderContacts();}\nhandle(\"login\",async event=>{\n  const form=event.currentTarget;\n  const details={email:value(form,\"email\"),password:new FormData(form).get(\"password\")};\n  const signup=event.submitter?.value===\"signup\";\n  const {data,error}=await (signup?db.auth.signUp(details):db.auth.signInWithPassword(details));\n  if(error)throw error;\n  status(signup&&!data.session?\"Check your email for the confirmation link.\":\"Signed in.\");\n  form.reset();\n});\nhandle(\"contact\",async event=>{\n  const form=event.currentTarget, phone=value(form,\"phone\").replace(/[ ()-]/g,\"\"),label=value(form,\"label\");\n  if(!user||!label||!/^\\+?[0-9]{7,15}$/.test(phone))throw Error(\"Enter a name and a valid phone number.\");\n  const saved=family;\n  if(saved.length>=12)throw Error(\"You can save up to 12 family members.\");\n  const {error}=await db.from(\"safelink_family\").insert({label,phone});if(error)throw error;await loadFamily();form.reset();\n});\nasync function rpc(name,args){const {data,error}=await db.rpc(name,args);if(error)throw error;return data;}\nasync function refresh(){\n  const id=active;\n  if(!id)return;\n  const rows=await rpc(\"safelink_circle_read\",{p_invite:id});\n  if(active!==id)return;\n  el(\"messages\").replaceChildren();\n  for(const message of rows){const li=document.createElement(\"li\");li.textContent=message.alias+\" · \"+message.message;el(\"messages\").append(li);}\n}\nhandle(\"circle\",async event=>{\n  const form=event.currentTarget, invite=value(form,\"invite\")||crypto.randomUUID().replaceAll(\"-\",\"\");\n  active=await rpc(\"safelink_circle_join\",{p_invite:invite,p_area:value(form,\"area\"),p_alias:value(form,\"alias\"),p_create:!value(form,\"invite\")});\n  el(\"invite\").textContent=\"Circle invite · \"+active;el(\"board\").hidden=false;\n  await refresh();\n});\nhandle(\"post\",async event=>{await rpc(\"safelink_circle_post\",{p_invite:active,p_message:value(event.currentTarget,\"message\")});await refresh();});\nel(\"refresh\").onclick=()=>refresh().catch(error=>status(error.message));\nel(\"leave\").onclick=async()=>{try{await rpc(\"safelink_circle_leave\",{p_invite:active});active=null;el(\"board\").hidden=true;el(\"invite\").textContent=\"\";el(\"messages\").replaceChildren();}catch(error){status(error.message);}};\nel(\"logout\").onclick=async()=>{const {error}=await db.auth.signOut();if(error)status(error.message);};\ndb.auth.onAuthStateChange((event,session)=>{\n  user=session?.user||null;\n  el(\"login\").hidden=!!user;el(\"member\").hidden=!user;\n  if(!user){active=null;el(\"board\").hidden=true;el(\"messages\").replaceChildren();el(\"invite\").textContent=\"\";}\n  family=[];renderContacts();\n  if(user)setTimeout(()=>loadFamily().catch(error=>status(error.message)),0);\n});\n}\n</script></html>", encoding="utf-8")
 
-Path("how-it-works.html").write_text("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>How SafeLink works</title><link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap\"><style>body{font:1.1rem Nunito,sans-serif;background:#f6efe4;color:#321d28;margin:auto;max-width:47rem;padding:clamp(1.2rem,5vw,4rem);line-height:1.6}h1,h2{font-weight:900;line-height:1.12;color:#601d36ed;letter-spacing:.02em;text-shadow:1px 1px #d4a2a080,0 0 8px #c7759e4d}section{border-top:1px solid #aa7f75;padding:.75rem 0}a{color:#70243f}</style><main><a href=\"./\">Back to SafeLink</a><h1>How SafeLink works</h1><section><h2>What it helps with</h2><p>SafeLink helps people compare unfamiliar journeys and find public places before travelling. Knowing where a hospital, station or shop is mapped gives users a place to check or a waypoint to plan around.</p></section><section><h2>From landmark to route</h2><ol><li>Choose a starting point, destination and optional stops.</li><li>The routing provider calculates walking or driving paths. SafeLink shows the routes it returns, up to three.</li><li>Where the OpenStreetMap lookup returns road data, SafeLink samples the route roughly every 30 metres and checks nearby tags for lighting, paving and rough surfaces.</li><li>Green means the mapped data met the stated checks. Red means a concern was mapped or there was insufficient coverage to meet those checks.</li></ol><p><a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap data and attribution</a></p></section><section><h2>How it can reduce exposure</h2><p>Users can compare paths, add public landmarks, and prepare a simulated Ride Call. These tools help people plan and make choices. They cannot predict or prevent an incident on their own.</p></section><section><h2>What the map cannot tell you</h2><p>Streetlights may be broken, shops may be closed, and potholes may be unmapped. Mapped shops do not establish whether people are currently present. SafeLink does not judge residents or infer whether people nearby are trustworthy. A green route is not a guarantee of personal safety.</p></section><section><h2>What to build next</h2><p>Pilot in a few Trichy streets with local partners. Ask volunteers to verify lighting and surface conditions at specific times, date each observation, and review reports before publishing them. Compare the results with field observations, then expand to more areas once the data is reliable.</p><p>Use a maintained local map extract for consistent coverage. Work with the municipality on lighting and road-maintenance feeds, and test privacy, accessibility and poor-network behavior before a public rollout.</p></section></main></html>", encoding="utf-8")
+Path("how-it-works.html").write_text("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>How SafeLink works</title><link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap\"><style>body{font:1.1rem Nunito,sans-serif;background:#f6efe4;color:#321d28;margin:auto;max-width:47rem;padding:clamp(1.2rem,5vw,4rem);line-height:1.6}h1,h2{font-weight:900;line-height:1.12;color:#601d36ed;letter-spacing:.02em;text-shadow:1px 1px #d4a2a080,0 0 8px #c7759e4d}section{border-top:1px solid #aa7f75;padding:.75rem 0}a{color:#70243f}</style><main><a href=\"./\">Back to SafeLink</a><h1>How SafeLink works</h1><section><h2>What it helps with</h2><p>SafeLink helps people compare unfamiliar journeys and find public places before travelling. Knowing where a hospital, station or shop is mapped gives users a place to check or a waypoint to plan around.</p></section><section><h2>From landmark to route</h2><ol><li>Choose a starting point, destination and optional stops.</li><li>The routing provider calculates walking or driving paths. SafeLink shows the routes it returns, up to three.</li><li>Where the OpenStreetMap lookup returns road data, SafeLink samples the route roughly every 30 metres and checks nearby tags for lighting, paving and rough surfaces.</li><li>Green means the mapped data met the stated checks. Red means a concern was mapped or there was insufficient coverage to meet those checks.</li></ol><p><a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap data and attribution</a></p></section><section><h2>How it can reduce exposure</h2><p>Users can compare paths, add public landmarks, and prepare a simulated Ride Call. These tools help people plan and make choices. They cannot predict or prevent an incident on their own.</p></section><section><h2>What the map cannot tell you</h2><p>Streetlights may be broken, shops may be closed, and potholes may be unmapped. Mapped shops do not establish whether people are currently present. SafeLink does not judge residents or infer whether people nearby are trustworthy. A green route is not a guarantee of personal safety.</p></section><section><h2>What to build next</h2><p>Pilot in a few Trichy streets with local partners. Ask volunteers to verify lighting and surface conditions at specific times, date each observation, and review reports before publishing them. Compare the results with field observations, then expand to more areas once the data is reliable.</p><p>Use a maintained local map extract for consistent coverage. Work with the municipality on lighting and road-maintenance feeds, and test privacy, accessibility and poor-network behavior before a public rollout.</p></section><footer class=\"safelink-contact aa-width\"><h2>About SafeLink</h2><p>Founded by Eraiyanbu and Jeswin Samuel.</p><h3>Professional enquiries</h3><p><a href=\"mailto:jeswinsamuel.la@gmail.com\">jeswinsamuel.la@gmail.com</a> · <a href=\"tel:+919597064942\">+91 9597064942</a></p></footer></main></html>", encoding="utf-8")
