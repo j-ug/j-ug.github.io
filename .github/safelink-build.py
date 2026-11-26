@@ -8,6 +8,13 @@ import subprocess
 VOICE_ENDPOINT = 'https://mqpmbiyoxzvpuxemgvtt.supabase.co/functions/v1/safelink-voice'
 
 STYLE = r"""
+.safelink-landmark-search { padding:.65rem; border:1px solid #ba9488; margin-bottom:.65rem; }
+.safelink-landmark-search label { display:inline-block; margin:.3rem; }
+.safelink-landmark-search input[type="search"] { max-width:100%; min-height:42px; }
+.safelink-landmark-search li { padding:.35rem 0; }
+.safelink-landmark-search button, #state-feature button { margin:.2rem; min-height:38px; }
+#state-feature small { display:block; }
+
 #call-level { display: block; width: min(220px,90%); height: 16px; margin: .45rem auto; }
 #call-level[hidden] { display: none; }
 .safelink-place-label { color:#352322; background:#fff9ed; border:1px solid #82545f; border-radius:5px; padding:3px 5px; cursor:pointer; max-width:150px; text-overflow:ellipsis; white-space:nowrap; overflow:hidden; }
@@ -688,7 +695,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v5:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v6:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -738,7 +745,7 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v5:" + home.pathname;
+const cacheKey = "safelink-kit-v6:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
@@ -809,6 +816,85 @@ def upgrade_atlas_map(atlas):
       Math.cos(a[1]*rad)*Math.cos(b[1]*rad)*Math.sin((b[0]-a[0])*rad/2)**2;
     return 12742000 * Math.asin(Math.sqrt(Math.min(1,h)));
   }
+
+  const search = document.createElement("form");
+  search.className = "safelink-landmark-search";
+  search.innerHTML = '<label>Search landmarks <input type="search" required minlength="2" maxlength="90" placeholder="Manapparai Railway Station"></label> <button>Search</button> <label><input type="checkbox" name="online"> Include OpenStreetMap online</label><p role="status"></p><ol></ol>';
+  el("state-start").before(search);
+  const field = search.querySelector('input[type="search"]');
+  const status = search.querySelector('[role="status"]');
+  const results = search.querySelector("ol");
+  const localIndex = new Map();
+  for (const [, id] of localAreas) {
+    if (!el(id)) continue;
+    const {origin:[y0,x0,sx,sy],places} = JSON.parse(el(id).textContent);
+    for (const [label,kind,x,y,type,id] of places) {
+      const osm="https://www.openstreetmap.org/"+type+"/"+id;
+      localIndex.set(osm,{label,kind,point:[x0+x/sx,y0-y/sy],osm});
+    }
+  }
+  function renderSearch(items) {
+    results.replaceChildren();
+    for (const place of items.slice(0,10)) {
+      const row = document.createElement("li");
+      row.textContent=place.label+" ";
+      for (const [role,label] of [["start","Set start"],["stop","Add stop"],["end","Set destination"]]) {
+        const button=document.createElement("button");
+        button.type="button"; button.textContent=label;
+        button.setAttribute("aria-label",label+" "+place.label);
+        button.onclick=()=>{
+          setPlace(place,role);
+          if (streetReady) map.easeTo({center:place.point,zoom:Math.max(14,map.getZoom())});
+          else { [lng,lat]=place.point; invalidate(); }
+          status.textContent=place.label+" selected.";
+        };
+        row.append(button);
+      }
+      results.append(row);
+    }
+  }
+  const geocodes=new Map();
+  let lookupAt=0;
+  search.addEventListener("submit",async event=>{
+    event.preventDefault();
+    const query=field.value.normalize("NFKC").trim();
+    if (query.length<2) return;
+    const key=query.toLocaleLowerCase();
+    const words=key.split(/\s+/);
+    const pool=new Map([...localIndex,...features.filter(p=>p.osm).map(p=>[p.osm,p])]);
+    const local=[...pool.values()].filter(p=>words.every(w=>p.label.normalize("NFKC").toLocaleLowerCase().includes(w)));
+    const isOnline=search.elements.online.checked && navigator.onLine;
+    renderSearch(local);
+    status.textContent=local.length?local.length+" mapped matches.":"No bundled or nearby matches.";
+    if (!isOnline) return;
+    const submit=search.querySelector("button");
+    if (submit.disabled) return;
+    submit.disabled=true;
+    try {
+      let rows=geocodes.get(key);
+      if (!rows) {
+        if (Date.now()-lookupAt<1100) return;
+        lookupAt=Date.now();
+        status.textContent="Searching OpenStreetMap…";
+        const params = new URLSearchParams({q:query+", Tamil Nadu, India",format:"jsonv2",countrycodes:"in",limit:"10",viewbox:"75.68,14.02,80.88,7.54",bounded:"1"});
+        rows=await fetchJson("https://nominatim.openstreetmap.org/search?"+params);
+        if (geocodes.size>=25) geocodes.delete(geocodes.keys().next().value);
+        geocodes.set(key,rows);
+      }
+      if (field.value.normalize("NFKC").trim().toLocaleLowerCase()!==key) return;
+      const found=new Map(local.map(p=>[p.osm,p]));
+      for (const item of rows) {
+        const point=[Number(item.lon),Number(item.lat)];
+        if (!point.every(Number.isFinite)||!inState(point)||!["node","way","relation"].includes(item.osm_type)||!Number.isSafeInteger(Number(item.osm_id))) continue;
+        const osm="https://www.openstreetmap.org/"+item.osm_type+"/"+item.osm_id;
+        if (!found.has(osm)) found.set(osm,{point,osm,kind:item.type,label:item.display_name});
+      }
+      renderSearch([...found.values()]);
+      status.textContent=found.size?found.size+" matching places · OpenStreetMap.":"No matches. Try adding the town name.";
+    } catch { status.textContent="Online lookup unavailable. Bundled results remain available."; }
+    finally { submit.disabled=false; }
+  });
+
   function contextFrom(json, centre, radius) {
     const candidates = (Array.isArray(json?.elements) ? json.elements : []).flatMap(item => {
       const tags = item.tags || {};
@@ -821,7 +907,7 @@ def upgrade_atlas_map(atlas):
       const subtype = tags.amenity || (tags.highway === "bus_stop" ? "bus stop" : tags.healthcare || tags.railway || tags.public_transport);
       const name = tags["name:en"] || tags.name || tags["name:ta"];
       const label = String(name || (kind === "lights" ? nouns[kind] : subtype || nouns[kind])).replaceAll("_"," ").slice(0,120);
-      return [{kind, point, label, distance, named: !!name, osm: "https://www.openstreetmap.org/" + item.type + "/" + item.id}];
+      return [{kind, point, label, distance, named: !!name, tags, osm: "https://www.openstreetmap.org/" + item.type + "/" + item.id}];
     }).sort((a,b) => a.distance-b.distance);
     const unique = [];
     for (const place of candidates) {
@@ -979,7 +1065,21 @@ def upgrade_atlas_map(atlas):
       button.type="button"; button.textContent=label;
       button.onclick=()=>setPlace(feature,role);
       target.append(button);
-    }""", 1)
+    }
+    const facts=feature.tags||{};
+    for (const [title,value] of [["Hours",facts.opening_hours],["Wheelchair access",facts.wheelchair],["Street",facts["addr:street"]],["Tamil name",facts["name:ta"]]]) {
+      if (!value) continue;
+      const line=document.createElement("small");
+      line.textContent=title+" · "+value;
+      target.append(line);
+    }
+    const link=(label,url)=>{
+      const a=document.createElement("a");
+      a.textContent=label; a.href=url; a.rel="noopener noreferrer"; a.target="_blank"; target.append(a);
+    };
+    if (feature.osm) link(" OpenStreetMap record",feature.osm);
+    if (/^Q\d+$/.test(facts.wikidata||"")) link(" Wikidata", "https://www.wikidata.org/wiki/"+facts.wikidata);
+    if (distanceMeters([78.683,10.8],feature.point)<12000) link(" Trichy visitor guide", "https://en.wikivoyage.org/wiki/Tiruchirappalli");""", 1)
     atlas = atlas.replace('namePoint(start);','namedStart||namePoint(start);',1).replace('namePoint(end);','namedEnd||namePoint(end);',1)
     atlas = atlas.replace('if (picking==="start") start=point;','if (picking==="start") {start=point;namedStart="";}',1).replace('if (picking==="end") end=point;','if (picking==="end") {end=point;namedEnd="";}',1)
     atlas = atlas.replace('[start,end].map(p=>p.map(n=>n.toFixed(5))','[start,...stops.map(stop=>stop.point),end].map(p=>p.map(n=>n.toFixed(5))',1)
@@ -1043,6 +1143,8 @@ if "<!doctype html>" not in atlas.lower() or atlas.count("</head>") != 1 or atla
     raise SystemExit("Expected a standalone atlas in index.html")
 
 atlas = upgrade_atlas_map(atlas)
+atlas = atlas.replace("</body>", '<script>const account=document.createElement("a"); account.href="account.html"; account.textContent="Account &amp; family"; document.getElementById("ride-open")?.before(account); document.getElementById("state-end")?.after(account.cloneNode(true));</script></body>', 1)
+atlas = atlas.replace("</body>", '<script>document.getElementById("robotics-tab")?.remove(); document.getElementById("main")?.setAttribute("hidden","");</script></body>', 1)
 
 site_base = 'new URL("./", location.href)'
 asset_base = 'new URL("./", document.currentScript.src)'
@@ -1072,3 +1174,5 @@ atlas = atlas.replace("</body>", scripts + "\n</body>", 1)
 app.write_text(atlas, encoding="utf-8")
 Path("mic-worklet.js").write_text(WORKLET, encoding="utf-8")
 Path("safelink-sw.js").write_text(OFFLINE.replace("__TAMIL_ASSETS__", repr(tamil_assets)), encoding="utf-8")
+
+Path("account.html").write_text("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SafeLink Account</title>\n<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap\">\n<style>[hidden]{display:none!important}*{box-sizing:border-box}body{margin:0;background:#f6efe4;color:#351e27;font:1rem Nunito,sans-serif}main{margin:2rem auto;padding:1.25rem;width:min(42rem,95%);background:#fff8ed;border:1px solid #aa7f75}form{display:grid;gap:.65rem}label{display:grid;gap:.25rem}input,select,button,a{font:inherit}input,select,button{min-height:44px;padding:.5rem}button{background:#5a233c;color:white;border:0;border-radius:.25rem}a{color:#70243f}li{margin:.5rem 0}section{margin-top:1.5rem}h1,h2{line-height:1.1}</style>\n<main><a href=\"./\">Back to SafeLink</a><h1>SafeLink Account</h1>\n<p id=\"auth-status\" role=\"status\"></p>\n<form id=\"login\"><label>Email<input name=\"email\" type=\"email\" autocomplete=\"email\" required></label><label>Password<input name=\"password\" type=\"password\" minlength=\"8\" autocomplete=\"current-password\" required></label><button value=\"login\">Sign in</button><button value=\"signup\">Create account</button></form>\n<div id=\"member\" hidden><button id=\"logout\">Sign out</button>\n<section><h2>Family call buttons</h2><p>Saved to your account. A call opens your device’s dialler.</p><form id=\"contact\"><label>Name<input name=\"label\" maxlength=\"50\" required></label><label>Phone<input name=\"phone\" type=\"tel\" maxlength=\"18\" required></label><button>Add family member</button></form><ul id=\"contacts\"></ul></section>\n<section><h2>Local circles</h2><p>Choose a locality and share a private invite to let other SafeLink users join its board. Members see an alias and preset messages.</p>\n<form id=\"circle\"><label>Locality<select name=\"area\"><option>Central Trichy</option><option>Woraiyur</option><option>Manapparai</option><option>Srirangam</option><option>Thillai Nagar</option></select></label><label>Alias<input name=\"alias\" maxlength=\"25\" required></label><label>Circle invite<input name=\"invite\" maxlength=\"32\" placeholder=\"Leave blank to create a circle\"></label><button>Open circle</button></form>\n<div id=\"board\" hidden><p id=\"invite\"></p><form id=\"post\"><label>Message<select name=\"message\"><option>Available for a public group walk</option><option>Looking for a walking buddy</option><option>Available for a check-in</option></select></label><button>Post to circle</button></form><button id=\"refresh\">Refresh board</button> <button id=\"leave\">Leave circle</button><ul id=\"messages\"></ul></div></section></div></main>\n<script src=\"https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.86.0/dist/umd/supabase.js\"></script>\n<script>\n\"use strict\";\nconst el=id=>document.getElementById(id);\nconst status=message=>{el(\"auth-status\").textContent=message;};\nif (!window.supabase) { status(\"Sign-in needs an internet connection.\"); } else {\nconst db=supabase.createClient(\"https://mqpmbiyoxzvpuxemgvtt.supabase.co\",\"sb_publishable_TH_RZVnVW783fTSluyfpOQ_ggdxucC4\");\nlet user=null, active=null, family=[];\nfunction value(form,name){return String(new FormData(form).get(name)||\"\").trim();}\nfunction handle(form,action){el(form).addEventListener(\"submit\",async event=>{event.preventDefault();const button=event.submitter;if(button)button.disabled=true;try{await action(event);}catch(error){status(error.message||\"Request failed.\");}finally{if(button)button.disabled=false;}});}\nfunction renderContacts(){\n  el(\"contacts\").replaceChildren();\n  const saved=family;\n  for(const item of saved) {\n    if(typeof item?.label!==\"string\"||!/^\\+?[0-9]{7,15}$/.test(item.phone))continue;\n    const row=document.createElement(\"li\"),a=document.createElement(\"a\"),remove=document.createElement(\"button\");\n    a.href=\"tel:\"+item.phone;a.textContent=\"Call \"+item.label;\n    remove.textContent=\"Remove\"; remove.type=\"button\";\n    remove.onclick=async()=>{remove.disabled=true;try{const {error}=await db.from(\"safelink_family\").delete().eq(\"id\",item.id);if(error)throw error;await loadFamily();}catch(e){status(e.message);remove.disabled=false;}};\n    row.append(a,\" \",remove);el(\"contacts\").append(row);\n  }\n}\nasync function loadFamily(){const id=user?.id;if(!id)return;const {data,error}=await db.from(\"safelink_family\").select(\"id,label,phone\").order(\"label\");if(user?.id!==id)return;if(error)throw error;family=data;renderContacts();}\nhandle(\"login\",async event=>{\n  const form=event.currentTarget;\n  const details={email:value(form,\"email\"),password:new FormData(form).get(\"password\")};\n  const signup=event.submitter?.value===\"signup\";\n  const {data,error}=await (signup?db.auth.signUp(details):db.auth.signInWithPassword(details));\n  if(error)throw error;\n  status(signup&&!data.session?\"Check your email for the confirmation link.\":\"Signed in.\");\n  form.reset();\n});\nhandle(\"contact\",async event=>{\n  const form=event.currentTarget, phone=value(form,\"phone\").replace(/[ ()-]/g,\"\"),label=value(form,\"label\");\n  if(!user||!label||!/^\\+?[0-9]{7,15}$/.test(phone))throw Error(\"Enter a name and a valid phone number.\");\n  const saved=family;\n  if(saved.length>=12)throw Error(\"You can save up to 12 family members.\");\n  const {error}=await db.from(\"safelink_family\").insert({label,phone});if(error)throw error;await loadFamily();form.reset();\n});\nasync function rpc(name,args){const {data,error}=await db.rpc(name,args);if(error)throw error;return data;}\nasync function refresh(){\n  const id=active;\n  if(!id)return;\n  const rows=await rpc(\"safelink_circle_read\",{p_invite:id});\n  if(active!==id)return;\n  el(\"messages\").replaceChildren();\n  for(const message of rows){const li=document.createElement(\"li\");li.textContent=message.alias+\" · \"+message.message;el(\"messages\").append(li);}\n}\nhandle(\"circle\",async event=>{\n  const form=event.currentTarget, invite=value(form,\"invite\")||crypto.randomUUID().replaceAll(\"-\",\"\");\n  active=await rpc(\"safelink_circle_join\",{p_invite:invite,p_area:value(form,\"area\"),p_alias:value(form,\"alias\"),p_create:!value(form,\"invite\")});\n  el(\"invite\").textContent=\"Circle invite · \"+active;el(\"board\").hidden=false;\n  await refresh();\n});\nhandle(\"post\",async event=>{await rpc(\"safelink_circle_post\",{p_invite:active,p_message:value(event.currentTarget,\"message\")});await refresh();});\nel(\"refresh\").onclick=()=>refresh().catch(error=>status(error.message));\nel(\"leave\").onclick=async()=>{try{await rpc(\"safelink_circle_leave\",{p_invite:active});active=null;el(\"board\").hidden=true;el(\"invite\").textContent=\"\";el(\"messages\").replaceChildren();}catch(error){status(error.message);}};\nel(\"logout\").onclick=async()=>{const {error}=await db.auth.signOut();if(error)status(error.message);};\ndb.auth.onAuthStateChange((event,session)=>{\n  user=session?.user||null;\n  el(\"login\").hidden=!!user;el(\"member\").hidden=!user;\n  if(!user){active=null;el(\"board\").hidden=true;el(\"messages\").replaceChildren();el(\"invite\").textContent=\"\";}\n  family=[];renderContacts();\n  if(user)setTimeout(()=>loadFamily().catch(error=>status(error.message)),0);\n});\n}\n</script></html>", encoding="utf-8")
