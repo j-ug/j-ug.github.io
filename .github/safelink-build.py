@@ -768,7 +768,7 @@ UPGRADE = r"""
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
       .then(async () => {
-        const cache = await caches.open("safelink-kit-v12:" + appRoot.pathname);
+        const cache = await caches.open("safelink-kit-v13:" + appRoot.pathname);
         if (!await cache.match(appRoot)) return;
         const status = el("safelink-cache");
         status.textContent = "Offline kit saved";
@@ -818,13 +818,13 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v12:" + home.pathname;
+const cacheKey = "safelink-kit-v13:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...["night-city.js","walk-toolkit.js","i18n-ta.json","manifest.webmanifest","safelink-icon.svg","impact.html","credits.html","night-assets/fonts.css",...__NIGHT_FILES__].map(path=>new URL(path,home).href), ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(cacheKey).then(async cache => {
-    await cache.addAll([home.href, ...assetURLs]);
+    await cache.addAll([...new Set([home.href, ...assetURLs])]);
     await self.skipWaiting();
   }));
 });
