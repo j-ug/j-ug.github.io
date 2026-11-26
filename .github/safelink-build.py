@@ -765,15 +765,17 @@ UPGRADE = r"""
   const appRoot = new URL("../", base);
   if ("serviceWorker" in navigator && location.protocol !== "file:" &&
       (location.pathname === appRoot.pathname || location.pathname === appRoot.pathname + "index.html")) {
+    const showOfflineStatus = async () => {
+      const cache = await caches.open("safelink-kit-v14:" + appRoot.pathname);
+      if (!await cache.match(appRoot)) return;
+      const status = el("safelink-cache");
+      status.textContent = "Offline kit saved";
+      status.hidden = false;
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", () => showOfflineStatus().catch(() => {}));
     navigator.serviceWorker.register(new URL("safelink-sw.js", appRoot), { scope: appRoot.pathname })
       .then(() => navigator.serviceWorker.ready)
-      .then(async () => {
-        const cache = await caches.open("safelink-kit-v13:" + appRoot.pathname);
-        if (!await cache.match(appRoot)) return;
-        const status = el("safelink-cache");
-        status.textContent = "Offline kit saved";
-        status.hidden = false;
-      })
+      .then(showOfflineStatus)
       .catch(() => {});
   }
 })();
@@ -818,13 +820,14 @@ registerProcessor("safelink-mic", SafeLinkMic);
 OFFLINE = r"""
 "use strict";
 const home = new URL("./", self.location.href);
-const cacheKey = "safelink-kit-v13:" + home.pathname;
+const cacheKey = "safelink-kit-v14:" + home.pathname;
 const assetURLs = [new URL("mic-worklet.js?v=1", home).href, ...["night-city.js","walk-toolkit.js","i18n-ta.json","manifest.webmanifest","safelink-icon.svg","impact.html","credits.html","night-assets/fonts.css",...__NIGHT_FILES__].map(path=>new URL(path,home).href), ...__TAMIL_ASSETS__.map(name => new URL(name, home).href)];
 const pagePaths = [home.pathname, home.pathname + "index.html"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(cacheKey).then(async cache => {
-    await cache.addAll([...new Set([home.href, ...assetURLs])]);
+    await cache.add(home.href);
+    await Promise.allSettled([...new Set(assetURLs)].map(url=>cache.add(url)));
     await self.skipWaiting();
   }));
 });
