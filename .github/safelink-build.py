@@ -1275,7 +1275,7 @@ def upgrade_route_conditions(atlas):
     routeChoices.replaceChildren();
     routePending=true;refreshControls();
     try {
-      const url="https://routing.openstreetmap.de/routed-"+mode+"/route/v1/driving/"+coordinates+"?alternatives=5&overview=full&geometries=geojson&steps=false";
+      const url="https://routing.openstreetmap.de/routed-"+mode+"/route/v1/driving/"+coordinates+"?alternatives=3&overview=full&geometries=geojson&steps=false";
       const json=await fetchJson(url,15);
       const options=(json.routes||[]).slice(0,6).map(item=>normalRoute({code:json.code,routes:[item]})).filter(Boolean);
       if (!options.length) throw Error("No route");
